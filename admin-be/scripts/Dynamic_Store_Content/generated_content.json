@@ -1,0 +1,16 @@
+[
+  {
+    "id": "124",
+    "name": "1 Exam Prep",
+    "tier": "A",
+    "error": "blocked: desc too short: 455w; meta too short: 68c; store name overused: 8x in body (max 6)",
+    "generated_at": "2026-03-02T11:00:08.463Z"
+  },
+  {
+    "id": "132",
+    "name": "110racing",
+    "tier": "A",
+    "error": "429 {\"error\":{\"message\":\"Rate limit reached for model `llama-3.3-70b-versatile` in organization `org_01khtk5vy1ejx9fnsvxp7pyr52` service tier `on_demand` on tokens per day (TPD): Limit 100000, Used 98536, Requested 3789. Please try again in 33m28.8s. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing\",\"type\":\"tokens\",\"code\":\"rate_limit_exceeded\"}}",
+    "generated_at": "2026-03-02T11:01:24.126Z"
+  }
+]

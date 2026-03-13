@@ -7,19 +7,21 @@
  *   3. Scrape Trustpilot
  *   4. Query Reddit
  *
+ * Output: scraped_results.json (only — no DB writes)
  * Hard 15s limit per subpage — never blocks pipeline
  * Reads merchants from local CSV — zero DB reads
- * Saves results to scraped_results.json after EACH store (crash-safe)
+ * Saves results after EACH store (crash-safe)
  * Resume-safe — skips already scraped merchants automatically
- * Bulk upserts to DB only when you're ready via --flush flag
  *
- * Run:         node scripts/Dynamic_Store_Content/02_scraper.js --limit=5
- * Resume:      node scripts/Dynamic_Store_Content/02_scraper.js (auto-skips done stores)
- * Flush to DB: node scripts/Dynamic_Store_Content/02_scraper.js --flush
+ * Run:             node scripts/Dynamic_Store_Content/02_scraper.js
+ * With limit:      node scripts/Dynamic_Store_Content/02_scraper.js --limit=5
+ * From ID:         node scripts/Dynamic_Store_Content/02_scraper.js --from-id=100
+ * Force re-scrape: node scripts/Dynamic_Store_Content/02_scraper.js --force
+ * Force one store: node scripts/Dynamic_Store_Content/02_scraper.js --force-id=123
+ * Dry run:         node scripts/Dynamic_Store_Content/02_scraper.js --dry-run
  */
 
 import pLimit from "p-limit";
-import { supabase } from "../../dbhelper/dbclient.js";
 import { discoverUrls } from "./url_discoverer.js";
 import {
   extractContent,
@@ -40,13 +42,32 @@ const SCRAPED_PATH = path.resolve(
   "./scripts/Dynamic_Store_Content/scraped_results.json",
 );
 
+// ─── Args ─────────────────────────────────────────────────────────────────────
+const args = process.argv.slice(2);
+const LIMIT = parseInt(
+  args.find((a) => a.startsWith("--limit="))?.split("=")[1] || "0",
+);
+const FROM_ID = parseInt(
+  args.find((a) => a.startsWith("--from-id="))?.split("=")[1] || "0",
+);
+const FORCE_ID = parseInt(
+  args.find((a) => a.startsWith("--force-id="))?.split("=")[1] || "0",
+);
+const DRY_RUN = args.includes("--dry-run");
+const FORCE_ALL = args.includes("--force");
+
+// ─── Config ───────────────────────────────────────────────────────────────────
+const CONCURRENCY = 1;
+const PAGE_DELAY_MS = 1500; // between subpages on same domain — avoids soft-blocks
+const SUBPAGE_TIMEOUT = 15000;
+
 // ─── Resume support ───────────────────────────────────────────────────────────
 let scrapedResults = [];
 if (fs.existsSync(SCRAPED_PATH)) {
   try {
-    const content = fs.readFileSync(SCRAPED_PATH, "utf8").trim();
-    if (content && content !== "[]") {
-      scrapedResults = JSON.parse(content);
+    const raw = fs.readFileSync(SCRAPED_PATH, "utf8").trim();
+    if (raw && raw !== "[]") {
+      scrapedResults = JSON.parse(raw);
       console.log(`📋 Resuming — ${scrapedResults.length} already scraped`);
     } else {
       console.log("📋 scraped_results.json empty, starting fresh");
@@ -58,30 +79,42 @@ if (fs.existsSync(SCRAPED_PATH)) {
     scrapedResults = [];
   }
 }
-const alreadyScraped = new Set(scrapedResults.map((r) => r.id?.toString()));
+
+// Build skip set — honour --force-id and --force-all
+const alreadyScraped = new Set(
+  FORCE_ALL
+    ? []
+    : scrapedResults
+        .filter((r) =>
+          FORCE_ID ? r.id?.toString() !== FORCE_ID.toString() : true,
+        )
+        .map((r) => r.id?.toString()),
+);
 
 function saveProgress() {
   fs.writeFileSync(SCRAPED_PATH, JSON.stringify(scrapedResults, null, 2));
 }
-// ─── Config ───────────────────────────────────────────────────────────────────
-const CONCURRENCY = 1;
-const PAGE_DELAY = 500;
-const SUBPAGE_TIMEOUT = 15000;
-const UPSERT_CHUNK = 50;
 
-const args = process.argv.slice(2);
-const LIMIT = parseInt(
-  args.find((a) => a.startsWith("--limit="))?.split("=")[1] || "0",
-);
-const FROM_ID = parseInt(
-  args.find((a) => a.startsWith("--from-id="))?.split("=")[1] || "0",
-);
-const DRY_RUN = args.includes("--dry-run");
-const FLUSH = args.includes("--flush");
+// ─── category_names parser ────────────────────────────────────────────────────
+// CSV stores category_names as a Python-style list string e.g. "['Clothing', 'Apparel']"
+// or a JSON array string. Normalise to a plain comma-separated string for the generator.
+function parseCategoryNames(raw) {
+  if (!raw || typeof raw !== "string") return "";
+  const trimmed = raw.trim();
+  // Already a clean string
+  if (!trimmed.startsWith("[")) return trimmed;
+  try {
+    // Try JSON parse first (double-quoted array)
+    const arr = JSON.parse(trimmed);
+    if (Array.isArray(arr)) return arr.join(", ");
+  } catch (_) {}
+  // Python-style single-quoted list: ['Clothing', 'Apparel']
+  const matches = trimmed.match(/'([^']+)'/g);
+  if (matches) return matches.map((s) => s.replace(/'/g, "")).join(", ");
+  return trimmed;
+}
 
-// ─── Helpers for data cleanup ─────────────────────────────────────────────────
-
-// ✅ NEW: filter out boilerplate Trustpilot platform text
+// ─── Trustpilot snippet cleaner ───────────────────────────────────────────────
 function cleanTrustpilotSnippets(snippets = []) {
   if (!Array.isArray(snippets)) return [];
   const banned = [
@@ -91,17 +124,18 @@ function cleanTrustpilotSnippets(snippets = []) {
     "read more",
     "learn more",
     "our software",
+    "trustpilot",
   ];
   return snippets.filter((s) => {
-    if (!s || typeof s !== "string") return false;
+    if (!s || typeof s !== "string" || s.length < 20) return false;
     const lower = s.toLowerCase();
     return !banned.some((b) => lower.includes(b));
   });
 }
 
-// ✅ NEW: filter obviously off-topic Reddit threads
+// ─── Reddit cleaner ───────────────────────────────────────────────────────────
 function cleanRedditData(reddit = {}, storeName = "") {
-  if (!reddit || typeof reddit !== "object")
+  if (!reddit || typeof reddit !== "object") {
     return {
       found: false,
       threads: [],
@@ -109,9 +143,21 @@ function cleanRedditData(reddit = {}, storeName = "") {
       commonComplaints: [],
       overallSentiment: "neutral",
     };
+  }
 
   const brand = (storeName || "").toLowerCase();
-  const usefulKeywords = [
+  const offTopicSubs = [
+    "destinythegame",
+    "superstonk",
+    "politics",
+    "gaming",
+    "pcgaming",
+    "costaricatravel",
+    "wallstreetbets",
+    "nfl",
+    "nba",
+  ];
+  const shoppingKeywords = [
     "coupon",
     "code",
     "discount",
@@ -123,6 +169,13 @@ function cleanRedditData(reddit = {}, storeName = "") {
     "refund",
     "scam",
     "legit",
+    "worth",
+    "recommend",
+    "buy",
+    "purchase",
+    "order",
+    "customer",
+    "service",
   ];
 
   const filteredThreads = (reddit.threads || []).filter((t) => {
@@ -131,90 +184,108 @@ function cleanRedditData(reddit = {}, storeName = "") {
     const snip = (t.snippet || "").toLowerCase();
     const sub = (t.subreddit || "").toLowerCase();
 
-    // hard skip obvious off-topic subs if brand is generic
-    const offTopicSubs = [
-      "destinythegame",
-      "superstonk",
-      "politics",
-      "gaming",
-      "pcgaming",
-      "costaricatravel",
-    ];
     if (offTopicSubs.includes(sub)) return false;
 
-    const inText = title.includes(brand) || snip.includes(brand);
-    const hasKeyword = usefulKeywords.some(
+    const hasBrand =
+      brand.length > 3 && (title.includes(brand) || snip.includes(brand));
+    const hasKeyword = shoppingKeywords.some(
       (k) => title.includes(k) || snip.includes(k),
     );
-    // require brand mention OR at least a coupon/review keyword
-    return inText || hasKeyword;
+
+    // Brand mention alone is sufficient. Keyword alone is not — too noisy.
+    return (
+      hasBrand ||
+      (hasKeyword &&
+        (title.includes(brand.split(" ")[0]) ||
+          snip.includes(brand.split(" ")[0])))
+    );
   });
 
-  const questions = Array.isArray(reddit.commonQuestions)
-    ? reddit.commonQuestions
-    : [];
-  const complaints = Array.isArray(reddit.commonComplaints)
-    ? reddit.commonComplaints
-    : [];
-
   return {
-    found: filteredThreads.length > 0 || reddit.found || false,
+    found: filteredThreads.length > 0, // only true if threads survived filter
     threads: filteredThreads.slice(0, 6),
-    commonQuestions: questions,
-    commonComplaints: complaints,
+    commonQuestions: Array.isArray(reddit.commonQuestions)
+      ? reddit.commonQuestions
+      : [],
+    commonComplaints: Array.isArray(reddit.commonComplaints)
+      ? reddit.commonComplaints
+      : [],
     overallSentiment: reddit.overallSentiment || "neutral",
   };
 }
 
 // ─── Scoring ──────────────────────────────────────────────────────────────────
+// Graduated scoring — more data = meaningfully higher score, not just binary flags
 function scoreRichness(data) {
   let s = 0;
   const w = data.website || {};
+  const hp = w.homepage || {};
   const tp = data.trustpilot || {};
   const rd = data.reddit || {};
 
-  if (w.homepage?.h1) s += 4;
-  if (w.homepage?.metaDescription?.length > 50) s += 6;
-  if (w.homepage?.heroTaglines?.length) s += 5;
-  if (w.homepage?.productHeadings?.length >= 3) s += 8;
-  if (w.homepage?.keyParagraphs?.length >= 2) s += 8;
-  if (w.homepage?.customerReviews?.length) s += 5;
-  if (w.homepage?.trustSignals?.returnWindow) s += 4;
-  if (w.homepage?.trustSignals?.freeShippingThreshold) s += 4;
-  if (w.homepage?.trustSignals?.warranty) s += 3;
-  if (w.homepage?.trustSignals?.reviewCount) s += 3;
-  if (w.homepage?.specialOffers?.financing) s += 2;
-  if (w.homepage?.specialOffers?.loyaltyProgram) s += 2;
-  if (w.homepage?.salePatterns?.length) s += 3;
-  if (w.about?.keyParagraphs?.length) s += 8;
+  // Homepage signals
+  if (hp.h1) s += 4;
+  if ((hp.metaDescription || "").length > 50) s += 6;
+  if (hp.heroTaglines?.length) s += Math.min(hp.heroTaglines.length, 4) * 1.5;
+  s += Math.min(hp.productHeadings?.length || 0, 10) * 0.8; // up to 8pts
+  s += Math.min(hp.keyParagraphs?.length || 0, 6) * 1.5; // up to 9pts
+  if (hp.customerReviews?.length) s += Math.min(hp.customerReviews.length, 5);
+  if (hp.trustSignals?.returnWindow) s += 4;
+  if (hp.trustSignals?.freeShippingThreshold) s += 4;
+  if (hp.trustSignals?.warranty) s += 3;
+  if (hp.trustSignals?.reviewCount) s += 3;
+  if (hp.specialOffers?.financing) s += 2;
+  if (hp.specialOffers?.loyaltyProgram) s += 2;
+  if (hp.specialOffers?.subscriptionSave) s += 2;
+  if (hp.specialOffers?.referralProgram) s += 1;
+  if (hp.salePatterns?.length) s += Math.min(hp.salePatterns.length, 3);
+
+  // Subpage signals
+  if (w.about?.keyParagraphs?.length)
+    s += Math.min(w.about.keyParagraphs.length, 4) * 2;
   if (w.about?.foundingStory) s += 4;
-  if (w.about?.stats?.length) s += 3;
-  if (w.faq?.faqs?.length >= 2) s += 10;
+  if (w.about?.stats?.length) s += Math.min(w.about.stats.length, 3);
+  if (w.faq?.faqs?.length >= 2) s += Math.min(w.faq.faqs.length, 8) * 1.2;
   if (w.shipping?.freeShippingThreshold) s += 4;
   if (w.returns?.returnWindow) s += 4;
+
+  // Third-party signals
   if (tp.found) s += 8;
   if (tp.rating) s += 3;
-  if (tp.snippets?.length >= 2) s += 5;
+  if (tp.snippets?.length >= 2) s += Math.min(tp.snippets.length, 5);
+  if (tp.commonPraise?.length) s += 2;
+  if (tp.commonComplaints?.length) s += 1; // complaints = real data
   if (rd.found) s += 5;
-  if (rd.commonQuestions?.length) s += 3;
+  if (rd.commonQuestions?.length) s += Math.min(rd.commonQuestions.length, 3);
+  if (rd.threads?.length >= 2) s += 2;
 
-  return Math.min(s, 100);
+  return Math.min(Math.round(s), 100);
 }
 
-function assignTier(score, hasCoupons, hasWebUrl) {
+function assignTier(score, couponCount, hasWebUrl) {
   if (!hasWebUrl) return "D";
-  if (score >= 55 && hasCoupons) return "A";
-  if (score >= 30) return "B";
-  if (score >= 10) return "C";
+  // High coupons lower the score bar for Tier A — monetisation priority
+  const couponBoost = couponCount >= 10 ? 10 : couponCount >= 5 ? 5 : 0;
+  const effectiveScore = score + couponBoost;
+  if (effectiveScore >= 55 && couponCount > 0) return "A";
+  if (effectiveScore >= 30) return "B";
+  if (effectiveScore >= 10) return "C";
   return "D";
 }
 
-// ─── Safe subpage fetch with hard timeout ────────────────────────────────────
+// ─── Safe subpage fetch with AbortController (actually cancels on timeout) ───
 async function tryFetchSubpage(url, category) {
-  return Promise.race([
-    extractContent(url, category),
-    new Promise((resolve) => setTimeout(() => resolve(null), SUBPAGE_TIMEOUT)),
-  ]);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), SUBPAGE_TIMEOUT);
+  try {
+    const result = await extractContent(url, category, controller.signal);
+    clearTimeout(timer);
+    return result;
+  } catch (err) {
+    clearTimeout(timer);
+    if (err.name === "AbortError") return null;
+    throw err;
+  }
 }
 
 // ─── Scrape one merchant ──────────────────────────────────────────────────────
@@ -222,7 +293,6 @@ async function scrapeMerchant(merchant) {
   const base = merchant.web_url?.replace(/\/$/, "");
   if (!base) return { score: 0, tier: "D", data: null };
 
-  // ✅ NEW: ensure consistent base structure
   const scraped = {
     website: {
       homepage: null,
@@ -240,8 +310,7 @@ async function scrapeMerchant(merchant) {
     scraped.website.homepage = extractHomepage(discovery.homepageHtml);
   }
 
-  const toScrape = ["about", "faq", "shipping", "returns"];
-  for (const category of toScrape) {
+  for (const category of ["about", "faq", "shipping", "returns"]) {
     const urls = discovery.classified[category] || [];
     if (!urls.length) continue;
     for (const { url } of urls) {
@@ -251,76 +320,68 @@ async function scrapeMerchant(merchant) {
         if (content.usedPlaywright) console.log(`      ↳ Playwright: ${url}`);
         break;
       }
-      await new Promise((r) => setTimeout(r, PAGE_DELAY));
+      await new Promise((r) => setTimeout(r, PAGE_DELAY_MS));
     }
   }
 
   let tp = await scrapeTrustpilot(base);
-  tp = {
+  scraped.trustpilot = {
     ...(tp || {}),
     snippets: cleanTrustpilotSnippets(tp?.snippets),
   };
 
-  await new Promise((r) => setTimeout(r, 500));
+  await new Promise((r) => setTimeout(r, 800));
 
-  let rd = await scrapeReddit(merchant.name, base);
-  rd = cleanRedditData(rd, merchant.name);
+  const rd = await scrapeReddit(merchant.name, base);
+  scraped.reddit = cleanRedditData(rd, merchant.name);
 
-  scraped.trustpilot = tp;
-  scraped.reddit = rd;
-
+  const couponCount = parseInt(merchant.active_coupons_count) || 0;
   const score = scoreRichness(scraped);
-  const tier = assignTier(
-    score,
-    (parseInt(merchant.active_coupons_count) || 0) > 0,
-    !!base,
-  );
+  const tier = assignTier(score, couponCount, !!base);
 
   return { score, tier, data: scraped };
 }
 
-// ─── Flush scraped_results.json → Supabase ───────────────────────────────────
-async function flushToDb() {
-  if (!fs.existsSync(SCRAPED_PATH)) {
-    console.log("❌ No scraped_results.json found. Run scraper first.");
-    return;
-  }
-  const results = JSON.parse(fs.readFileSync(SCRAPED_PATH));
-  const updates = results
-    .filter((r) => !r.error)
-    .map((r) => ({
-      id: parseInt(r.id),
-      content_status: r.tier === "D" ? "noindex" : "scraped",
-      content_tier: r.tier,
-      scrape_score: r.score,
-      scraped_data: r.scraped_data,
-      scrape_attempted_at: r.scraped_at,
-    }));
+// ─── Summary ──────────────────────────────────────────────────────────────────
+function printSummary(results) {
+  const ok = results.filter((r) => !r.error);
+  const errored = results.filter((r) => r.error);
+  const tiers = { A: 0, B: 0, C: 0, D: 0 };
+  let totalScore = 0,
+    withTp = 0,
+    withFaq = 0,
+    withReddit = 0;
 
-  console.log(`💾 Flushing ${updates.length} results to DB...`);
-  for (let i = 0; i < updates.length; i += UPSERT_CHUNK) {
-    const chunk = updates.slice(i, i + UPSERT_CHUNK);
-    const { error } = await supabase.from("merchants").upsert(chunk);
-    if (error) console.error(`  ✗ Upsert error:`, error.message);
-    else
-      console.log(
-        `  ✓ ${Math.min(i + UPSERT_CHUNK, updates.length)}/${updates.length}`,
-      );
+  for (const r of ok) {
+    tiers[r.tier] = (tiers[r.tier] || 0) + 1;
+    totalScore += r.score || 0;
+    if (r.scraped_data?.trustpilot?.found) withTp++;
+    if (r.scraped_data?.website?.faq?.faqs?.length >= 2) withFaq++;
+    if (r.scraped_data?.reddit?.found) withReddit++;
   }
-  console.log("🏁 Flush complete.");
+
+  console.log(`\n${"─".repeat(50)}`);
+  console.log(
+    `🏁 Scrape complete — ${ok.length} ok | ${errored.length} errors`,
+  );
+  console.log(
+    `   Tiers:   A=${tiers.A}  B=${tiers.B}  C=${tiers.C}  D=${tiers.D}`,
+  );
+  console.log(
+    `   Avg score:    ${ok.length ? Math.round(totalScore / ok.length) : 0}`,
+  );
+  console.log(`   Trustpilot:   ${withTp}/${ok.length}`);
+  console.log(`   Has FAQs:     ${withFaq}/${ok.length}`);
+  console.log(`   Has Reddit:   ${withReddit}/${ok.length}`);
+  console.log(`   Output:       ${SCRAPED_PATH}`);
+  console.log(`${"─".repeat(50)}\n`);
 }
 
+// ─── Main ─────────────────────────────────────────────────────────────────────
 async function main() {
-  if (FLUSH) return flushToDb();
-
   console.log(
     `🔍 Scraper | Concurrency: ${CONCURRENCY} | Limit: ${LIMIT || "all"} | DryRun: ${DRY_RUN}\n`,
   );
-
-  const limiter = pLimit(CONCURRENCY);
-
-  // ─── SINGLE CSV LOADING ─────────────────────────────────────────────────────
-  console.log("📁 Looking for CSV at:", CSV_PATH);
 
   if (!fs.existsSync(CSV_PATH)) {
     console.error(`❌ CSV not found: ${CSV_PATH}`);
@@ -332,43 +393,46 @@ async function main() {
     skip_empty_lines: true,
     trim: true,
   });
-
-  console.log("🔍 RAW CSV rows:", raw.length);
+  console.log(`📁 CSV loaded: ${raw.length} rows`);
 
   const ALL_MERCHANTS = raw.filter((m) => {
     const isPublish = (m.is_publish || "").toString().trim().toLowerCase();
     const status = (m.content_status || "").toString().trim().toLowerCase();
-    return (
-      isPublish === "true" && ["template", "failed", "noindex"].includes(status)
-    );
+    // Exclude noindex (Tier D — no web_url, scraping them is pointless)
+    // Exclude scrape_failed unless --force is passed
+    const validStatuses = FORCE_ALL
+      ? ["template", "failed", "scraped", "scrape_failed"]
+      : ["template", "failed"];
+    return isPublish === "true" && validStatuses.includes(status);
   });
+  console.log(`📋 Eligible merchants: ${ALL_MERCHANTS.length}`);
 
-  console.log(`📋 Filtered merchants: ${ALL_MERCHANTS.length}`);
-
-  // ─── Filter merchants to scrape ──────────────────────────────────────────────
   let merchants = ALL_MERCHANTS.filter(
     (m) => !alreadyScraped.has(m.id?.toString()),
   );
   if (FROM_ID) merchants = merchants.filter((m) => parseInt(m.id) >= FROM_ID);
+  if (FORCE_ID)
+    merchants = ALL_MERCHANTS.filter((m) => parseInt(m.id) === FORCE_ID);
   if (LIMIT) merchants = merchants.slice(0, LIMIT);
 
   console.log(
-    `📦 To scrape: ${merchants.length} stores (${alreadyScraped.size} already done)\n`,
+    `📦 To scrape: ${merchants.length} | Already done: ${alreadyScraped.size}\n`,
   );
 
   if (!merchants.length) {
     console.log(
-      "✅ Nothing to scrape. Use --force or delete scraped_results.json",
+      "✅ Nothing to scrape. Use --force to re-scrape all or --force-id=N for one store.",
     );
     return;
   }
 
-  // ─── Scrape loop ─────────────────────────────────────────────────────────────
+  const limiter = pLimit(CONCURRENCY);
+  const sessionResults = [];
+
   await Promise.all(
     merchants.map((m) =>
       limiter(async () => {
         console.log(`  ↳ ${m.name} (${m.web_url})`);
-
         try {
           const { score, tier, data } = await scrapeMerchant(m);
 
@@ -376,7 +440,7 @@ async function main() {
             ? `⭐${data.trustpilot.rating}(${data.trustpilot.reviewCount})`
             : "no-tp";
           const rdStr = data?.reddit?.found
-            ? `💬${data.reddit.threads.length}`
+            ? `💬${data.reddit.threads.length}t`
             : "no-reddit";
           const faqStr = data?.website?.faq?.faqs?.length
             ? `FAQs:${data.website.faq.faqs.length}`
@@ -385,42 +449,54 @@ async function main() {
             `    ✓ Tier:${tier} Score:${score} | ${faqStr} | ${tpStr} | ${rdStr}`,
           );
 
+          const record = {
+            id: m.id,
+            name: m.name,
+            slug: m.slug,
+            web_url: m.web_url,
+            active_coupons_count: m.active_coupons_count,
+            category_names: parseCategoryNames(m.category_names), // normalised string
+            tier,
+            score,
+            scraped_data: data,
+            scraped_at: new Date().toISOString(),
+          };
+
           if (!DRY_RUN) {
-            scrapedResults.push({
-              id: m.id,
-              name: m.name,
-              slug: m.slug,
-              web_url: m.web_url,
-              active_coupons_count: m.active_coupons_count,
-              category_names: m.category_names,
-              tier,
-              score,
-              scraped_data: data,
-              scraped_at: new Date().toISOString(),
-            });
+            // If force-rescraping, replace existing record
+            if (FORCE_ID || FORCE_ALL) {
+              const idx = scrapedResults.findIndex(
+                (r) => r.id?.toString() === m.id?.toString(),
+              );
+              if (idx >= 0) scrapedResults[idx] = record;
+              else scrapedResults.push(record);
+            } else {
+              scrapedResults.push(record);
+            }
             saveProgress();
           }
+          sessionResults.push(record);
         } catch (err) {
-          console.error(`    ✗ ${err.message}`);
+          console.error(`    ✗ ${m.name}: ${err.message}`);
+          const errRecord = {
+            id: m.id,
+            name: m.name,
+            tier: "D",
+            score: 0,
+            error: err.message.substring(0, 500),
+            scraped_at: new Date().toISOString(),
+          };
           if (!DRY_RUN) {
-            scrapedResults.push({
-              id: m.id,
-              name: m.name,
-              tier: "D",
-              score: 0,
-              error: err.message.substring(0, 500),
-              scraped_at: new Date().toISOString(),
-            });
+            scrapedResults.push(errRecord);
             saveProgress();
           }
+          sessionResults.push(errRecord);
         }
       }),
     ),
   );
 
-  console.log(`\n🏁 Done. Scraped: ${merchants.length} stores.`);
-  console.log(`💾 Results saved to: ${SCRAPED_PATH}`);
-  console.log(`💡 When ready to push to DB: node 02_scraper.js --flush`);
+  printSummary(sessionResults);
 }
 
 main().catch(console.error);
